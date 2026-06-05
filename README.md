@@ -125,6 +125,40 @@ your checkout. Use sandbox runtime when you want the agent to create or replace
 an HF Space sandbox, test code remotely, or request GPU sandbox hardware before
 launching larger HF Jobs.
 
+## Use from Claude Code / Codex CLI
+
+If you already drive your sessions from another agent (Claude Code, Codex CLI,
+or any MCP-aware client) you can expose ml-intern's research tools to that
+agent without running the ml-intern loop or supplying an Anthropic/OpenAI key.
+The host agent handles reasoning; ml-intern only provides tools.
+
+Launch the server with:
+
+```bash
+ml-intern-mcp
+```
+
+This serves the following tools over stdio MCP: `hf_papers`, `web_search`,
+`explore_hf_docs`, `fetch_hf_docs`, `hf_inspect_dataset`, `hf_repo_files`,
+`hf_repo_git`, `github_find_examples`, `github_list_repos`, `github_read_file`.
+Set `HF_TOKEN` and `GITHUB_TOKEN` in the environment (or the project `.env`)
+so the HF/GitHub tools can authenticate. `hf_jobs`, the sandbox tools, and the
+internal research sub-agent are intentionally not exposed — those need
+ml-intern's own event loop.
+
+**Claude Code** — register the server with the `claude mcp` CLI:
+
+```bash
+claude mcp add ml-intern -- ml-intern-mcp
+```
+
+**Codex CLI** — add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.ml-intern]
+command = "ml-intern-mcp"
+```
+
 ## Sharing Traces
 
 Every session is auto-uploaded to your **own private Hugging Face dataset**
