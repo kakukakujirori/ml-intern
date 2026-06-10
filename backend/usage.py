@@ -2,13 +2,20 @@
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-USAGE_EVENT_TYPES = ("llm_call", "hf_job_complete")
+from agent.core.cost_estimation import SPACE_PRICE_USD_PER_HOUR
+
+USAGE_EVENT_TYPES = (
+    "llm_call",
+    "hf_job_complete",
+    "sandbox_create",
+    "sandbox_destroy",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +119,7 @@ def resolve_usage_windows(
     *,
     now: datetime | None = None,
 ) -> dict[str, datetime | str]:
-    """Return UTC day/month windows for a browser timezone."""
+    """Return UTC month window for a browser timezone."""
     try:
         tz = ZoneInfo(timezone_name or "UTC")
     except (ZoneInfoNotFoundError, ValueError):
@@ -120,12 +127,10 @@ def resolve_usage_windows(
 
     now_utc = _utc(now or datetime.now(UTC))
     local_now = now_utc.astimezone(tz)
-    today_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    month_local = today_local.replace(day=1)
+    month_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return {
         "timezone": tz.key,
         "now_utc": now_utc,
-        "today_start_utc": today_local.astimezone(UTC),
         "month_start_utc": month_local.astimezone(UTC),
     }
 
@@ -133,26 +138,23 @@ def resolve_usage_windows(
 def _empty_bucket(
     *,
     session_id: str | None = None,
-    window_start: datetime | None = None,
-    window_end: datetime | None = None,
-    timezone: str | None = None,
 ) -> dict[str, Any]:
     return {
         "session_id": session_id,
-        "window_start": _iso(window_start),
-        "window_end": _iso(window_end),
-        "timezone": timezone,
         "total_usd": 0.0,
         "inference_usd": 0.0,
         "hf_jobs_estimated_usd": 0.0,
+        "sandbox_estimated_usd": 0.0,
         "llm_calls": 0,
         "hf_jobs_count": 0,
+        "sandbox_count": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "cache_read_tokens": 0,
         "cache_creation_tokens": 0,
         "total_tokens": 0,
         "hf_jobs_billable_seconds_estimate": 0,
+        "sandbox_billable_seconds_estimate": 0,
     }
 
 
@@ -178,16 +180,8 @@ def aggregate_usage_events(
     events: list[dict[str, Any]],
     *,
     session_id: str | None = None,
-    window_start: datetime | None = None,
-    window_end: datetime | None = None,
-    timezone: str | None = None,
 ) -> dict[str, Any]:
-    bucket = _empty_bucket(
-        session_id=session_id,
-        window_start=window_start,
-        window_end=window_end,
-        timezone=timezone,
-    )
+    bucket = _empty_bucket(session_id=session_id)
     for event in events:
         event_type = event.get("event_type")
         data = event.get("data") or {}
@@ -217,14 +211,112 @@ def aggregate_usage_events(
             bucket["hf_jobs_billable_seconds_estimate"] += _coerce_int(
                 data.get("billable_seconds_estimate") or data.get("wall_time_s")
             )
+        elif event_type == "sandbox_destroy":
+            # Sandbox costs are paired and added after the main pass so the
+            # create event can provide hardware pricing metadata.
+            continue
+
+    _aggregate_sandbox_usage(events, bucket)
 
     bucket["inference_usd"] = round(bucket["inference_usd"], 6)
     bucket["hf_jobs_estimated_usd"] = round(bucket["hf_jobs_estimated_usd"], 6)
+    bucket["sandbox_estimated_usd"] = round(bucket["sandbox_estimated_usd"], 6)
     bucket["total_usd"] = round(
-        bucket["inference_usd"] + bucket["hf_jobs_estimated_usd"],
+        (
+            bucket["inference_usd"]
+            + bucket["hf_jobs_estimated_usd"]
+            + bucket["sandbox_estimated_usd"]
+        ),
         6,
     )
     return bucket
+
+
+def _event_sort_key(
+    indexed_event: tuple[int, dict[str, Any]],
+) -> tuple[bool, datetime, int]:
+    index, event = indexed_event
+    created_at = event_created_at(event)
+    return (
+        created_at is None,
+        created_at or datetime.min.replace(tzinfo=UTC),
+        index,
+    )
+
+
+def _sandbox_id(event: dict[str, Any]) -> str | None:
+    data = event.get("data") or {}
+    sandbox_id = data.get("sandbox_id")
+    return sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
+
+
+def _sandbox_duration_seconds(
+    create_event: dict[str, Any],
+    destroy_event: dict[str, Any],
+) -> int:
+    create_data = create_event.get("data") or {}
+    destroy_data = destroy_event.get("data") or {}
+    lifetime_s = _coerce_int(destroy_data.get("lifetime_s"))
+
+    if lifetime_s > 0:
+        # Telemetry starts the lifetime clock before create latency elapses.
+        return lifetime_s
+
+    create_at = event_created_at(create_event)
+    destroy_at = event_created_at(destroy_event)
+    if create_at is None or destroy_at is None:
+        return 0
+    create_latency_s = max(0, _coerce_int(create_data.get("create_latency_s")))
+    interval_start = create_at - timedelta(seconds=create_latency_s)
+    if destroy_at <= interval_start:
+        return 0
+    return int((destroy_at - interval_start).total_seconds())
+
+
+def _aggregate_sandbox_usage(
+    events: list[dict[str, Any]],
+    bucket: dict[str, Any],
+) -> None:
+    lifecycle_events = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.get("event_type") in {"sandbox_create", "sandbox_destroy"}
+    ]
+    ordered_events = [
+        event
+        for _, event in sorted(
+            lifecycle_events,
+            key=_event_sort_key,
+        )
+    ]
+    active_creates: dict[str, dict[str, Any]] = {}
+
+    for event in ordered_events:
+        event_type = event.get("event_type")
+        sandbox_id = _sandbox_id(event)
+        if sandbox_id is None:
+            continue
+
+        if event_type == "sandbox_create":
+            active_creates[sandbox_id] = event
+            continue
+
+        if event_type != "sandbox_destroy":
+            continue
+
+        create_event = active_creates.pop(sandbox_id, None)
+        if create_event is None:
+            continue
+
+        create_data = create_event.get("data") or {}
+        hardware = str(create_data.get("hardware") or "cpu-basic")
+        price_usd_per_hour = SPACE_PRICE_USD_PER_HOUR.get(hardware, 0.0)
+        seconds = _sandbox_duration_seconds(create_event, event)
+
+        bucket["sandbox_count"] += 1
+        if price_usd_per_hour > 0:
+            bucket["sandbox_billable_seconds_estimate"] += seconds
+        bucket["sandbox_estimated_usd"] += price_usd_per_hour * (seconds / 3600)
 
 
 def _account_bucket_from_billing_usage(
@@ -474,15 +566,12 @@ async def _build_hf_account_usage(
     session_id: str | None,
     timezone: str,
     now_utc: datetime,
-    today_start: datetime,
     month_start: datetime,
-    include_rollups: bool = True,
 ) -> dict[str, Any]:
     account_usage: dict[str, Any] = {
         "source": "hf_billing_usage_v2",
         "available": False,
         "current_session": None,
-        "today": None,
         "month": None,
         "inference_providers_credits": None,
     }
@@ -513,13 +602,6 @@ async def _build_hf_account_usage(
             ),
         ),
     }
-    if include_rollups:
-        window_tasks["today"] = (
-            today_start,
-            asyncio.create_task(
-                _fetch_hf_billing_usage_v2(hf_token, start=today_start, end=now_utc)
-            ),
-        )
     if session_start is not None:
         if baseline_month_start is not None:
             window_tasks["current_session_baseline"] = (
@@ -676,12 +758,10 @@ async def build_usage_response(
     session_id: str | None = None,
     timezone_name: str | None = None,
     now: datetime | None = None,
-    include_rollups: bool = True,
 ) -> dict[str, Any]:
     windows = resolve_usage_windows(timezone_name, now=now)
     timezone = str(windows["timezone"])
     now_utc = windows["now_utc"]
-    today_start = windows["today_start_utc"]
     month_start = windows["month_start_utc"]
 
     session_events: list[dict[str, Any]] = []
@@ -692,32 +772,13 @@ async def build_usage_response(
             session_id=session_id,
         )
 
-    today_events: list[dict[str, Any]] = []
-    month_events: list[dict[str, Any]] = []
-    if include_rollups:
-        today_events = await _load_usage_events(
-            manager,
-            user_id=user_id,
-            start=today_start,
-            end=now_utc,
-            timezone_name=timezone,
-        )
-        month_events = await _load_usage_events(
-            manager,
-            user_id=user_id,
-            start=month_start,
-            end=now_utc,
-            timezone_name=timezone,
-        )
     hf_account = await _build_hf_account_usage(
         manager,
         hf_token=hf_token,
         session_id=session_id,
         timezone=timezone,
         now_utc=now_utc,
-        today_start=today_start,
         month_start=month_start,
-        include_rollups=include_rollups,
     )
 
     return {
@@ -729,18 +790,6 @@ async def build_usage_response(
             aggregate_usage_events(session_events, session_id=session_id)
             if session_id
             else None
-        ),
-        "today": aggregate_usage_events(
-            today_events,
-            window_start=today_start,
-            window_end=now_utc,
-            timezone=timezone,
-        ),
-        "month": aggregate_usage_events(
-            month_events,
-            window_start=month_start,
-            window_end=now_utc,
-            timezone=timezone,
         ),
         "hf_account": hf_account,
         "links": {

@@ -10,11 +10,13 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from usage import (  # noqa: E402
+    USAGE_EVENT_TYPES,
     _account_bucket_from_billing_usage,
     aggregate_usage_events,
     build_usage_response,
     resolve_usage_windows,
 )
+from agent.core import session_persistence  # noqa: E402
 
 
 def _event(event_type, data=None, created_at="2026-06-01T12:00:00+00:00"):
@@ -25,7 +27,7 @@ def _event(event_type, data=None, created_at="2026-06-01T12:00:00+00:00"):
     }
 
 
-def test_aggregate_usage_events_sums_inference_and_jobs():
+def test_aggregate_usage_events_sums_inference_jobs_and_sandboxes():
     events = [
         _event(
             "llm_call",
@@ -46,6 +48,22 @@ def test_aggregate_usage_events_sums_inference_and_jobs():
                 "billable_seconds_estimate": 1800,
             },
         ),
+        _event(
+            "sandbox_create",
+            {
+                "sandbox_id": "alice/sandbox-12345678",
+                "hardware": "cpu-upgrade",
+            },
+            created_at="2026-06-01T12:30:00+00:00",
+        ),
+        _event(
+            "sandbox_destroy",
+            {
+                "sandbox_id": "alice/sandbox-12345678",
+                "lifetime_s": 3600,
+            },
+            created_at="2026-06-01T13:30:00+00:00",
+        ),
     ]
 
     usage = aggregate_usage_events(events, session_id="s1")
@@ -53,15 +71,18 @@ def test_aggregate_usage_events_sums_inference_and_jobs():
     assert usage["session_id"] == "s1"
     assert usage["llm_calls"] == 2
     assert usage["hf_jobs_count"] == 1
+    assert usage["sandbox_count"] == 1
     assert usage["prompt_tokens"] == 110
     assert usage["completion_tokens"] == 50
     assert usage["cache_read_tokens"] == 25
     assert usage["cache_creation_tokens"] == 5
     assert usage["total_tokens"] == 190
     assert usage["hf_jobs_billable_seconds_estimate"] == 1800
+    assert usage["sandbox_billable_seconds_estimate"] == 3600
     assert usage["inference_usd"] == 0.375
     assert usage["hf_jobs_estimated_usd"] == 1.5
-    assert usage["total_usd"] == 1.875
+    assert usage["sandbox_estimated_usd"] == 0.05
+    assert usage["total_usd"] == 1.925
 
 
 def test_aggregate_usage_events_treats_missing_costs_as_zero():
@@ -77,6 +98,84 @@ def test_aggregate_usage_events_treats_missing_costs_as_zero():
     assert usage["prompt_tokens"] == 7
     assert usage["hf_jobs_billable_seconds_estimate"] == 60
     assert usage["total_usd"] == 0.0
+
+
+def test_aggregate_usage_events_ignores_active_sandbox_before_destroy():
+    usage = aggregate_usage_events(
+        [
+            _event(
+                "sandbox_create",
+                {
+                    "sandbox_id": "alice/sandbox-12345678",
+                    "hardware": "a100-large",
+                },
+            )
+        ]
+    )
+
+    assert usage["sandbox_count"] == 0
+    assert usage["sandbox_estimated_usd"] == 0.0
+    assert usage["sandbox_billable_seconds_estimate"] == 0
+    assert usage["total_usd"] == 0.0
+
+
+def test_aggregate_usage_events_counts_cpu_basic_sandbox_as_free():
+    usage = aggregate_usage_events(
+        [
+            _event(
+                "sandbox_create",
+                {
+                    "sandbox_id": "alice/sandbox-12345678",
+                    "hardware": "cpu-basic",
+                },
+            ),
+            _event(
+                "sandbox_destroy",
+                {
+                    "sandbox_id": "alice/sandbox-12345678",
+                    "lifetime_s": 3600,
+                },
+            ),
+        ]
+    )
+
+    assert usage["sandbox_count"] == 1
+    assert usage["sandbox_estimated_usd"] == 0.0
+    assert usage["sandbox_billable_seconds_estimate"] == 0
+    assert usage["total_usd"] == 0.0
+
+
+def test_aggregate_usage_events_falls_back_to_sandbox_timestamps():
+    usage = aggregate_usage_events(
+        [
+            _event(
+                "sandbox_create",
+                {
+                    "sandbox_id": "alice/sandbox-12345678",
+                    "hardware": "t4-small",
+                },
+                created_at="2026-06-01T12:00:00+00:00",
+            ),
+            _event(
+                "sandbox_destroy",
+                {"sandbox_id": "alice/sandbox-12345678"},
+                created_at="2026-06-01T12:30:00+00:00",
+            ),
+        ]
+    )
+
+    assert usage["sandbox_count"] == 1
+    assert usage["sandbox_billable_seconds_estimate"] == 1800
+    assert usage["sandbox_estimated_usd"] == 0.3
+    assert usage["total_usd"] == 0.3
+
+
+def test_usage_event_type_allowlists_include_sandbox_lifecycle():
+    assert set(USAGE_EVENT_TYPES) >= {"sandbox_create", "sandbox_destroy"}
+    assert set(session_persistence.USAGE_EVENT_TYPES) >= {
+        "sandbox_create",
+        "sandbox_destroy",
+    }
 
 
 def test_account_bucket_from_hf_billing_usage_v2():
@@ -112,7 +211,6 @@ def test_usage_windows_respect_browser_timezone():
     )
 
     assert windows["timezone"] == "America/Los_Angeles"
-    assert windows["today_start_utc"] == datetime(2026, 6, 1, 7, 0, tzinfo=UTC)
     assert windows["month_start_utc"] == datetime(2026, 6, 1, 7, 0, tzinfo=UTC)
 
 
@@ -162,7 +260,7 @@ def _agent_session(session_id, user_id, events):
 
 
 @pytest.mark.asyncio
-async def test_runtime_usage_excludes_other_users():
+async def test_usage_response_omits_app_rollups_without_session():
     manager = _Manager(
         {
             "owner-session": _agent_session(
@@ -186,9 +284,7 @@ async def test_runtime_usage_excludes_other_users():
         now=datetime(2026, 6, 1, 13, 0, tzinfo=UTC),
     )
 
-    assert usage["today"]["llm_calls"] == 1
-    assert usage["today"]["inference_usd"] == 0.5
-    assert usage["month"]["inference_usd"] == 0.5
+    assert usage["session"] is None
 
 
 @pytest.mark.asyncio
@@ -219,11 +315,10 @@ async def test_runtime_usage_includes_requested_session_total():
 
     assert usage["session"]["session_id"] == "s1"
     assert usage["session"]["inference_usd"] == 0.25
-    assert usage["today"]["inference_usd"] == 0.0
 
 
 @pytest.mark.asyncio
-async def test_runtime_usage_interprets_naive_timestamps_in_browser_timezone():
+async def test_runtime_usage_includes_requested_session_tokens():
     manager = _Manager(
         {
             "s1": _agent_session(
@@ -249,9 +344,7 @@ async def test_runtime_usage_interprets_naive_timestamps_in_browser_timezone():
     )
 
     assert usage["session"]["llm_calls"] == 1
-    assert usage["today"]["llm_calls"] == 1
-    assert usage["month"]["llm_calls"] == 1
-    assert usage["today"]["total_tokens"] == 42
+    assert usage["session"]["total_tokens"] == 42
 
 
 @pytest.mark.asyncio
@@ -311,8 +404,6 @@ async def test_hf_account_usage_uses_usage_window_for_current_delta(monkeypatch)
         calls.append((start, end))
         if start == usage_window_started_at:
             used_nano = 500_000_000
-        elif start == datetime(2026, 6, 5, 0, 0, tzinfo=UTC):
-            used_nano = 1_000_000_000
         else:
             used_nano = 2_000_000_000
         return {
@@ -340,7 +431,6 @@ async def test_hf_account_usage_uses_usage_window_for_current_delta(monkeypatch)
 
     assert usage["hf_account"]["available"] is True
     assert usage["hf_account"]["current_session"]["inference_providers_usd"] == 0.5
-    assert usage["hf_account"]["today"]["inference_providers_usd"] == 1.0
     assert usage["hf_account"]["month"]["inference_providers_usd"] == 2.0
     assert usage["hf_account"]["inference_providers_credits"] == {
         "included_usd": 2.0,
@@ -353,7 +443,6 @@ async def test_hf_account_usage_uses_usage_window_for_current_delta(monkeypatch)
         "period_end": None,
     }
     assert {start for start, _ in calls} == {
-        datetime(2026, 6, 5, 0, 0, tzinfo=UTC),
         datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
         usage_window_started_at,
     }
@@ -452,7 +541,6 @@ async def test_hf_account_usage_falls_back_to_persisted_created_at(monkeypatch):
         session_id="s1",
         timezone_name="UTC",
         now=datetime(2026, 6, 5, 13, 0, tzinfo=UTC),
-        include_rollups=False,
     )
 
     assert usage["hf_account"]["current_session"]["window_start"] == (
@@ -465,7 +553,7 @@ async def test_hf_account_usage_falls_back_to_persisted_created_at(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_compact_usage_skips_unused_rollup_loads(monkeypatch):
+async def test_usage_response_loads_only_session_events(monkeypatch):
     session_created_at = datetime(2026, 6, 5, 12, 0, tzinfo=UTC)
     store = _RecordingStore()
     manager = _Manager(
@@ -503,7 +591,6 @@ async def test_compact_usage_skips_unused_rollup_loads(monkeypatch):
         session_id="s1",
         timezone_name="UTC",
         now=datetime(2026, 6, 5, 13, 0, tzinfo=UTC),
-        include_rollups=False,
     )
 
     assert store.calls == [("owner", {"session_id": "s1", "start": None, "end": None})]
@@ -512,7 +599,4 @@ async def test_compact_usage_skips_unused_rollup_loads(monkeypatch):
         session_created_at,
     }
     assert datetime(2026, 6, 5, 0, 0, tzinfo=UTC) not in billing_starts
-    assert usage["today"]["llm_calls"] == 0
-    assert usage["month"]["llm_calls"] == 0
-    assert usage["hf_account"]["today"] is None
     assert usage["hf_account"]["month"]["inference_providers_usd"] == 0.0

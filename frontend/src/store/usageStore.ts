@@ -3,20 +3,20 @@ import { apiFetch } from '@/utils/api';
 
 export interface UsageBucket {
   session_id?: string | null;
-  window_start?: string | null;
-  window_end?: string | null;
-  timezone?: string | null;
   total_usd: number;
   inference_usd: number;
   hf_jobs_estimated_usd: number;
+  sandbox_estimated_usd: number;
   llm_calls: number;
   hf_jobs_count: number;
+  sandbox_count: number;
   prompt_tokens: number;
   completion_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
   total_tokens: number;
   hf_jobs_billable_seconds_estimate: number;
+  sandbox_billable_seconds_estimate: number;
 }
 
 export interface HfAccountUsageBucket {
@@ -46,7 +46,6 @@ export interface HfAccountUsage {
   available: boolean;
   error?: string | null;
   current_session: HfAccountUsageBucket | null;
-  today: HfAccountUsageBucket | null;
   month: HfAccountUsageBucket | null;
   inference_providers_credits: HfInferenceProvidersCredits | null;
 }
@@ -57,13 +56,11 @@ export interface UsageResponse {
   generated_at: string;
   timezone: string;
   session: UsageBucket | null;
-  today: UsageBucket;
-  month: UsageBucket;
   hf_account?: HfAccountUsage | null;
   links: Record<string, string>;
 }
 
-type UsageEventType = 'llm_call' | 'hf_job_complete';
+type UsageEventType = 'llm_call' | 'hf_job_complete' | 'sandbox_destroy';
 
 interface UsageStore {
   usage: UsageResponse | null;
@@ -93,7 +90,6 @@ function usageUrl(sessionId?: string | null): string {
   const params = new URLSearchParams();
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   params.set('tz', timezone);
-  params.set('include_rollups', 'false');
   if (sessionId) params.set('session_id', sessionId);
   return `/api/usage?${params.toString()}`;
 }
@@ -129,7 +125,11 @@ function applyEventToBucket(
       intValue(data.billable_seconds_estimate) || intValue(data.wall_time_s);
   }
 
-  next.total_usd = roundUsd(next.inference_usd + next.hf_jobs_estimated_usd);
+  next.total_usd = roundUsd(
+    next.inference_usd +
+      next.hf_jobs_estimated_usd +
+      (next.sandbox_estimated_usd ?? 0),
+  );
   return next;
 }
 
@@ -165,6 +165,11 @@ export const useUsageStore = create<UsageStore>()((set, get) => ({
   },
 
   applyUsageEvent: (sessionId, eventType, data) => {
+    if (eventType === 'sandbox_destroy') {
+      void get().fetchUsage(sessionId);
+      return;
+    }
+
     const current = get().usage;
     if (!current) return;
     set({
@@ -174,8 +179,6 @@ export const useUsageStore = create<UsageStore>()((set, get) => ({
           current.session?.session_id === sessionId
             ? applyEventToBucket(current.session, eventType, data)
             : current.session,
-        today: applyEventToBucket(current.today, eventType, data) ?? current.today,
-        month: applyEventToBucket(current.month, eventType, data) ?? current.month,
       },
     });
   },

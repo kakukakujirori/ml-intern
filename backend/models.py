@@ -122,23 +122,23 @@ class SessionYoloRequest(BaseModel):
 
 
 class UsageBucket(BaseModel):
-    """App-attributed usage totals for a session or time window."""
+    """App-attributed usage totals for a session."""
 
     session_id: str | None = None
-    window_start: str | None = None
-    window_end: str | None = None
-    timezone: str | None = None
     total_usd: float = 0.0
     inference_usd: float = 0.0
     hf_jobs_estimated_usd: float = 0.0
+    sandbox_estimated_usd: float = 0.0
     llm_calls: int = 0
     hf_jobs_count: int = 0
+    sandbox_count: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     total_tokens: int = 0
     hf_jobs_billable_seconds_estimate: int = 0
+    sandbox_billable_seconds_estimate: int = 0
 
 
 class HfAccountUsageBucket(BaseModel):
@@ -174,7 +174,6 @@ class HfAccountUsage(BaseModel):
     available: bool = False
     error: str | None = None
     current_session: HfAccountUsageBucket | None = None
-    today: HfAccountUsageBucket | None = None
     month: HfAccountUsageBucket | None = None
     inference_providers_credits: HfInferenceProvidersCredits | None = None
 
@@ -187,8 +186,6 @@ class UsageResponse(BaseModel):
     generated_at: str
     timezone: str
     session: UsageBucket | None = None
-    today: UsageBucket
-    month: UsageBucket
     hf_account: HfAccountUsage | None = None
     links: dict[str, str] = Field(default_factory=dict)
 
